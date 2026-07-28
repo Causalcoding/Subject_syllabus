@@ -149,6 +149,26 @@ train_scores, val_scores = validation_curve(
 
 **Complexity/dimensionality note:** degree-$d$ polynomial features on $p$ original features produce $O(p^d)$ terms (with interactions) — curse of dimensionality kicks in fast; regularization (Ridge/Lasso) is almost mandatory beyond low degrees.
 
+### Loss Functions for Regression: MSE, MAE, Huber, Quantile
+
+The choice of loss function is what the model actually optimizes during training — distinct from the *evaluation metric* you report afterward (see [Model Evaluation](06_Feature_Engineering_and_Model_Evaluation.md) for the full metrics survey). For regression, the training loss determines what "best fit" means and how sensitive the model is to outliers.
+
+| Loss | Formula (per point, residual $r=y-\hat y$) | Gradient w.r.t. $\hat y$ | Behavior |
+|---|---|---|---|
+| MSE / L2 | $r^2$ | $-2r$ (grows linearly with error) | Optimal under Gaussian-noise MLE assumption; heavily penalizes large residuals — very sensitive to outliers since error is squared |
+| MAE / L1 | $\lvert r\rvert$ | $-\text{sign}(r)$ (constant magnitude) | Optimal under Laplace-noise MLE assumption; robust to outliers, but non-differentiable at $r=0$ and gradient doesn't shrink near the optimum (can cause oscillation late in training) |
+| Huber | $\begin{cases}\frac12 r^2 & \lvert r\rvert\le\delta\\ \delta(\lvert r\rvert-\frac12\delta) & \lvert r\rvert>\delta\end{cases}$ | $-r$ inside $\delta$, $-\delta\,\text{sign}(r)$ outside | Quadratic (MSE-like) for small residuals, linear (MAE-like) for large ones — combines MSE's smooth gradient near the optimum with MAE's outlier robustness. $\delta$ is a tunable threshold |
+| Quantile (pinball) loss | $\begin{cases}\tau\, r & r\ge 0\\ (\tau-1)\, r & r<0\end{cases}$ for quantile $\tau\in(0,1)$ | Asymmetric constant slope | Minimizing it yields the $\tau$-th conditional quantile of $y\mid x$ (not the mean) — used to produce **prediction intervals** (fit $\tau=0.1$ and $\tau=0.9$ for an 80% interval) rather than a single point estimate; $\tau=0.5$ recovers MAE |
+
+```python
+from sklearn.linear_model import HuberRegressor, QuantileRegressor
+huber = HuberRegressor(epsilon=1.35)          # epsilon is the delta threshold (in units of scaled residual std)
+q90 = QuantileRegressor(quantile=0.9, alpha=0.0)  # upper bound of a prediction interval
+```
+
+- **Why it matters beyond regression:** the same MSE-vs-MAE-vs-Huber tradeoff reappears in gradient boosting (`loss="huber"` in `GradientBoostingRegressor`), in deep learning regression heads, and in any "robust regression" discussion.
+- **Pitfall:** picking MSE by default when the target has heavy-tailed noise or occasional data-entry outliers silently lets a handful of extreme points dominate the fit — Huber or MAE is usually the safer default when outlier contamination is plausible and unverified.
+
 ### Interview Questions
 
 1. **Derive the OLS normal equation from the RSS objective.**
@@ -196,6 +216,15 @@ train_scores, val_scores = validation_curve(
 15. **In production, your linear regression model's coefficients change sign between retraining runs on similar data. What's the likely cause and fix?**
     Answer: Likely multicollinearity — near-singular $X^TX$ makes coefficient estimates highly sensitive to small data perturbations, and different retraining samples can flip signs even though predictions stay similar. Fix: check VIF, apply Ridge/Elastic Net for stability, or drop/combine redundant features. Emphasize that if the goal is prediction accuracy (not coefficient interpretation), this instability may not matter much — but it's dangerous if coefficients are used for business decisions.
 
+16. **Why is MSE the "default" loss for linear regression, and under what distributional assumption is it the maximum-likelihood choice?**
+    Answer: Minimizing MSE is equivalent to maximum likelihood estimation under the assumption that residuals are i.i.d. Gaussian with constant variance: the Gaussian log-likelihood's only term depending on $\hat y$ is $-\frac{1}{2\sigma^2}\sum (y-\hat y)^2$, so maximizing likelihood = minimizing $\sum(y-\hat y)^2$ = minimizing MSE. It's "default" because it's differentiable everywhere (clean closed-form/gradient-based optimization) and the Gaussian-noise assumption is a reasonable default for many real-valued measurement errors.
+
+17. **Your regression target has occasional extreme outliers (data-entry errors you can't fully filter out) — why might Huber loss beat both plain MSE and plain MAE here?**
+    Answer: Plain MSE squares the residual, so a handful of extreme outliers can dominate the total loss and pull the fitted line toward them. Plain MAE is robust to outliers but has a constant-magnitude gradient everywhere (including near zero), which can cause the optimizer to oscillate around the minimum instead of settling smoothly. Huber loss gets the best of both: quadratic (MSE-like, smoothly differentiable) behavior for small residuals so it converges cleanly near the optimum, but linear (MAE-like) behavior beyond the threshold $\delta$ so a few extreme outliers contribute bounded, not squared, loss.
+
+18. **How does quantile (pinball) loss differ conceptually from MSE/MAE, and what does minimizing it actually estimate?**
+    Answer: MSE minimization estimates the conditional *mean* $E[y\mid x]$; MAE minimization estimates the conditional *median*. Quantile loss is asymmetric — it penalizes over-predictions and under-predictions differently depending on $\tau$ — and minimizing it for a given $\tau$ recovers the conditional $\tau$-th *quantile* of $y\mid x$. This is why it's used to build prediction intervals (e.g., fit $\tau=0.05$ and $\tau=0.95$ models to get a 90% interval) rather than a single point forecast, which matters whenever stakeholders need calibrated uncertainty bounds, not just a point estimate.
+
 ---
 
 ## Supervised Learning — Classification
@@ -237,6 +266,38 @@ model.fit(X_train, y_train)
 **Hyperparameters:** `C` (inverse of regularization strength λ — smaller C = stronger regularization), `penalty` (l1/l2/elasticnet — l1 gives sparse/interpretable coefficients), `class_weight` (handle imbalance), `solver` (`liblinear` for small/l1, `lbfgs`/`newton-cg` for l2/multinomial, `saga` for large-scale/elasticnet).
 
 **Strengths/weaknesses.** Fast, probabilistic outputs, highly interpretable (odds ratios), well-calibrated by default. Cannot capture non-linear boundaries without manual feature engineering (interactions, polynomial terms), sensitive to outliers in a moderate way, assumes independent observations.
+
+### The Perceptron
+
+**Concept.** The perceptron (Rosenblatt, 1958) is the historical ancestor of both logistic regression and linear SVM — the earliest algorithm to learn a linear decision boundary directly from mistakes, using a simple **online, mistake-driven update rule** rather than an explicit probabilistic or margin-based objective.
+
+**Prediction rule.** $\hat y = \text{sign}(w^Tx+b) \in \{-1,+1\}$ — a hard threshold, not a probability (unlike logistic regression's sigmoid).
+
+**Learning rule.** For each training example, only update weights if the current model misclassifies it:
+$$\text{if } y_i(w^Tx_i+b) \le 0: \quad w \leftarrow w + \eta\, y_i x_i,\qquad b \leftarrow b + \eta\, y_i$$
+Correctly classified points cause no update at all — the perceptron only "learns from mistakes."
+
+**Perceptron criterion (implicit loss).** This update rule is exactly gradient descent on the perceptron loss $L(w) = \max(0, -y(w^Tx+b))$, summed over misclassified points only. Compare to hinge loss $\max(0, 1-y(w^Tx+b))$ (SVM) — the perceptron loss has no margin term, so it stops updating as soon as a point crosses to the correct side of the boundary with zero margin, whereas SVM keeps pushing until a margin of 1 is achieved. This is the key mathematical difference between "any separating hyperplane" (perceptron) and "the maximum-margin separating hyperplane" (SVM).
+
+**Convergence (Novikoff's theorem).** If the training data is linearly separable with margin $\gamma$ (distance from the closest point to the true separating hyperplane) and all points satisfy $\|x_i\|\le R$, the perceptron algorithm makes at most $(R/\gamma)^2$ mistakes before converging to a separating hyperplane — a finite bound with no dependence on the number of training points or dimensionality. If the data is **not** linearly separable, the vanilla perceptron never converges (it will cycle indefinitely) — this was the historical motivation for margin-based methods (SVM) and, when the XOR problem was famously identified as not linearly separable, contributed to the "AI winter" until multi-layer perceptrons with backpropagation (see [Deep Learning](08_Deep_Learning.md)) resolved it by stacking learned non-linear feature transforms.
+
+```python
+from sklearn.linear_model import Perceptron
+clf = Perceptron(eta0=1.0, max_iter=1000, tol=1e-3)
+clf.fit(X_train, y_train)
+```
+
+**Comparison — Perceptron vs Logistic Regression vs Linear SVM:**
+
+| | Perceptron | Logistic Regression | Linear SVM |
+|---|---|---|---|
+| Output | Hard label (sign) | Calibrated probability | Hard label (+ optional Platt scaling) |
+| Loss | Perceptron loss (0 for any correct side) | Log loss (never exactly 0) | Hinge loss (0 once margin ≥ 1) |
+| Boundary found | *Any* separating hyperplane | Max-likelihood boundary | *Maximum-margin* separating hyperplane |
+| Convergence on separable data | Finite mistake bound, but boundary not unique | Converges to unique MLE optimum (convex) | Converges to unique max-margin optimum (convex) |
+| Behavior on non-separable data | Never converges (oscillates) | Converges (log loss always finite) | Converges (soft margin via slack $\xi_i$) |
+
+**Strengths/weaknesses.** Extremely simple, cheap, online/streaming-friendly (one point at a time, no batch requirement). No probability output, no margin robustness, doesn't converge on non-separable data without modifications (e.g., pocket algorithm, averaging), superseded in practice by logistic regression/SVM — its main modern relevance is pedagogical (foundation of neural network units) and historical.
 
 ### Naive Bayes
 
@@ -374,6 +435,80 @@ svm_lin = SVC(kernel="linear", C=1.0)
 
 **Strengths/weaknesses.** Effective in high dimensions (even $d > n$), robust to overfitting with proper $C$/kernel choice, memory-efficient (sparse support vectors), works well with clear margin of separation. Slow to train on large datasets, sensitive to kernel/hyperparameter choice, no direct probability output (needs Platt scaling), less interpretable than trees/linear models, requires feature scaling.
 
+### Linear & Quadratic Discriminant Analysis (LDA / QDA)
+
+**Concept.** LDA and QDA are **generative** classifiers (like Naive Bayes): instead of directly modeling $P(y|x)$, they model each class's feature distribution $P(x|y=k)$ as multivariate Gaussian, then apply Bayes' rule to classify. This is distinct from — and not to be confused with — **Latent Dirichlet Allocation** (also abbreviated LDA), an unrelated unsupervised topic-modeling algorithm covered in [NLP](09_NLP.md).
+
+**Assumption.** $x\mid y=k \sim \mathcal{N}(\mu_k, \Sigma_k)$. **LDA** assumes all classes share the *same* covariance matrix $\Sigma_k=\Sigma$; **QDA** allows each class its own $\Sigma_k$.
+
+**Discriminant functions (from Bayes' rule, dropping the shared normalizing constant).**
+
+LDA (shared $\Sigma$):
+$$\delta_k(x) = x^T\Sigma^{-1}\mu_k - \tfrac12\mu_k^T\Sigma^{-1}\mu_k + \ln\pi_k$$
+This is **linear** in $x$ — the quadratic term $x^T\Sigma^{-1}x$ cancels when comparing any two classes' discriminant functions because $\Sigma$ is shared, leaving a linear decision boundary (hence "linear" discriminant analysis).
+
+QDA (class-specific $\Sigma_k$):
+$$\delta_k(x) = -\tfrac12\ln|\Sigma_k| - \tfrac12(x-\mu_k)^T\Sigma_k^{-1}(x-\mu_k) + \ln\pi_k$$
+The $x^T\Sigma_k^{-1}x$ term no longer cancels across classes, giving a **quadratic** decision boundary — more flexible, but many more parameters to estimate ($K$ separate $d\times d$ covariance matrices instead of 1 shared one).
+
+Predict $\hat y = \arg\max_k \delta_k(x)$.
+
+**LDA as dimensionality reduction (Fisher's LDA).** Beyond classification, LDA also gives a *supervised* dimensionality-reduction technique: find the projection direction(s) $w$ that maximize between-class separation relative to within-class scatter:
+$$J(w) = \frac{w^TS_Bw}{w^TS_Ww}, \qquad S_B=\sum_k n_k(\mu_k-\bar\mu)(\mu_k-\bar\mu)^T,\quad S_W=\sum_k\sum_{i\in k}(x_i-\mu_k)(x_i-\mu_k)^T$$
+The optimal $w$ is the top eigenvector(s) of $S_W^{-1}S_B$. Unlike **PCA** (unsupervised, maximizes total variance regardless of class labels), LDA explicitly uses class labels to find the projection that best *separates* classes — for a $K$-class problem, LDA can produce at most $K-1$ discriminant directions (since $S_B$ has rank $\le K-1$), which is why it's commonly used as a supervised pre-processing/visualization step (e.g., project to 2D for a 3-class problem) as well as a standalone classifier.
+
+**LDA vs QDA vs Logistic Regression:**
+
+| | LDA | QDA | Logistic Regression |
+|---|---|---|---|
+| Model type | Generative ($P(x\mid y)$) | Generative ($P(x\mid y)$) | Discriminative ($P(y\mid x)$ directly) |
+| Boundary shape | Linear | Quadratic | Linear |
+| Covariance assumption | Shared across classes | Class-specific | None (no distributional assumption on $x$) |
+| Parameters to estimate | $O(Kd + d^2)$ | $O(Kd + Kd^2)$ | $O(Kd)$ |
+| Data efficiency | Good with limited data (fewer params) | Needs more data per class (full $\Sigma_k$ each) | Good, robust to non-Gaussian $x$ |
+| Best when | Gaussian-ish classes, similar spread, small-to-moderate $n$ | Gaussian-ish classes, genuinely different spreads, enough data per class | Don't want to assume a feature distribution at all; only need the boundary |
+| Sensitive to outliers? | Yes (Gaussian MLE) | Yes, more so (small $\Sigma_k$ per class) | Moderately |
+
+```python
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+
+lda = LinearDiscriminantAnalysis(n_components=2)   # use as classifier or as a supervised dim-reduction transform
+X_lda = lda.fit_transform(X_train, y_train)
+qda = QuadraticDiscriminantAnalysis().fit(X_train, y_train)
+```
+
+**Pitfalls.** Requires $\Sigma$ (or each $\Sigma_k$) to be invertible — fails or becomes unstable when $d>n$ or features are highly collinear (fix: shrinkage estimator, `shrinkage="auto"` in sklearn, which regularizes $\Sigma$ toward a diagonal/scaled-identity matrix, analogous to Ridge). Both LDA and QDA degrade when the Gaussian assumption is badly violated (e.g., multimodal or heavy-tailed class distributions) — logistic regression or tree-based models are more robust in that case. QDA needs meaningfully more training data than LDA to reliably estimate each class's full covariance matrix, especially in high dimensions.
+
+### Multiclass Classification Strategies: One-vs-Rest, One-vs-One, Native Multiclass
+
+Many classifiers (logistic regression via softmax, decision trees, Naive Bayes, KNN) generalize to $K>2$ classes natively. Others — most notably SVM — are fundamentally *binary* classifiers and need an explicit decomposition strategy to handle multiclass problems. This generalizes the OvR/softmax comparison already introduced under Logistic Regression to any base binary classifier.
+
+**One-vs-Rest (OvR / OvA).** Train $K$ independent binary classifiers, classifier $k$ distinguishing "class $k$" vs "everything else." Predict the class whose classifier gives the highest confidence score. Simple and parallelizable, but: (a) each binary sub-problem is inherently class-imbalanced (1 class vs the other $K-1$ combined), and (b) scores from independently-trained classifiers aren't on a comparable scale, so raw argmax comparison can be unreliable unless scores are well-calibrated.
+
+**One-vs-One (OvO).** Train $\binom{K}{2}$ binary classifiers, one per pair of classes, each trained only on the subset of data belonging to those two classes. Predict via majority vote across all pairwise classifiers (the class winning the most pairwise "duels"). Each individual classifier trains faster (smaller, more balanced sub-datasets), and OvO is often more accurate for SVM specifically since each pairwise problem is simpler/more separable — this is why sklearn's `SVC` uses OvO internally by default for multiclass, while `LinearSVC` uses OvR. The downside is $O(K^2)$ classifiers, which becomes expensive for large $K$.
+
+**Native multiclass.** Some algorithms need no decomposition at all: decision trees/Random Forest/GBM split on impurity criteria (Gini/entropy) that generalize directly to $K$ classes, Naive Bayes takes $\arg\max_k$ over any number of classes, KNN majority-votes over however many classes appear among neighbors, and softmax regression jointly models all $K$ classes' probabilities in one coherent model.
+
+**Comparison:**
+
+| | OvR | OvO | Native multiclass |
+|---|---|---|---|
+| # classifiers | $K$ | $\binom{K}{2}$ | 1 |
+| Training data per classifier | Full dataset (relabeled) | Only the 2 relevant classes | Full dataset |
+| Scales to large $K$? | Moderate (linear in $K$) | Poor (quadratic in $K$) | Best |
+| Class imbalance per sub-problem | Yes (1 vs rest) | No (balanced pairs) | N/A |
+| Typical use | Any binary classifier, default for `LinearSVC`, `SGDClassifier` | Kernel SVM (`SVC` default), when pairwise separability is easier | Trees, Naive Bayes, KNN, softmax regression |
+
+```python
+from sklearn.multiclass import OneVsRestClassifier, OneVsOneClassifier
+from sklearn.svm import SVC
+
+ovr = OneVsRestClassifier(SVC(kernel="rbf")).fit(X_train, y_train)
+ovo = OneVsOneClassifier(SVC(kernel="rbf")).fit(X_train, y_train)
+```
+
+**Pitfall.** OvR with poorly-calibrated base classifiers can produce ties or nonsensical rankings (e.g., all $K$ "vs rest" classifiers predicting "not me" with low confidence) — wrapping base classifiers with `probability=True`/Platt scaling before comparing scores helps. OvO's majority vote can also produce ties for even $K$; sklearn breaks ties using aggregated decision-function magnitude.
+
 ### Interview Questions
 
 1. **Derive the log loss for logistic regression from the maximum likelihood principle.**
@@ -420,6 +555,30 @@ svm_lin = SVC(kernel="linear", C=1.0)
 
 15. **Scenario: You need a model for a spam-filtering system with millions of emails and a strict 5 ms latency budget per prediction. Rank Naive Bayes, KNN, and kernel SVM for this use case and justify.**
     Answer: Naive Bayes is the best fit — training is a single pass of counting (very fast, can retrain frequently on streaming data), and prediction is $O(d)$ (just a sum over feature log-probabilities), easily meeting tight latency budgets, and it has a long, proven track record for text classification. KNN is poor here — prediction requires scanning/searching a huge training set per query, and with millions of emails/high-dimensional bag-of-words features, this is both slow and hurt by the curse of dimensionality. Kernel SVM is also poor for latency — prediction cost scales with the number of support vectors, and both training and serving are heavier than Naive Bayes; a *linear* SVM would be more competitive but still generally not faster than Naive Bayes at this scale.
+
+16. **Explain the perceptron convergence theorem, and what happens if you run the perceptron algorithm on data that isn't linearly separable?**
+    Answer: If the data is linearly separable with margin $\gamma$ (the distance from the closest point to some true separating hyperplane) and all feature vectors satisfy $\|x_i\|\le R$, Novikoff's theorem guarantees the perceptron makes at most $(R/\gamma)^2$ mistakes (weight updates) before it converges to a hyperplane that separates the data perfectly — a finite bound independent of $n$ or $d$. If the data is not linearly separable, no such hyperplane exists, so the algorithm never stops making mistakes — weights oscillate indefinitely rather than converging, which is why non-separable/noisy data requires either a margin-tolerant method (soft-margin SVM), a probabilistic method (logistic regression), or perceptron variants like the pocket algorithm (keep the best-performing weight vector seen so far).
+
+17. **What is the key mathematical difference between the perceptron's loss and SVM's hinge loss, and what behavioral difference does it cause?**
+    Answer: Perceptron loss is $\max(0, -y(w^Tx+b))$ — exactly zero the instant a point is on the correct side of the boundary, regardless of how close it is. Hinge loss is $\max(0, 1-y(w^Tx+b))$ — it remains positive (and keeps contributing gradient) until a point is correctly classified with margin *at least 1*, not just margin 0. This means the perceptron will happily settle on any separating hyperplane, even one that passes uncomfortably close to some points, while SVM's hinge loss keeps pushing the boundary until it maximizes the margin, producing a solution that generalizes better to unseen points near the boundary.
+
+18. **Derive why LDA's decision boundary is linear while QDA's is quadratic.**
+    Answer: Both derive discriminant functions from Bayes' rule with Gaussian class-conditional densities: $\delta_k(x) = -\frac12\ln|\Sigma_k| - \frac12(x-\mu_k)^T\Sigma_k^{-1}(x-\mu_k) + \ln\pi_k$. Expanding the quadratic form gives a term $-\frac12x^T\Sigma_k^{-1}x$ that depends on $x$ quadratically. In QDA, each class has its own $\Sigma_k$, so this quadratic-in-$x$ term differs between classes and survives when you compare $\delta_j(x)-\delta_k(x)$, producing a quadratic decision boundary. In LDA, all classes share the same $\Sigma$, so the $-\frac12x^T\Sigma^{-1}x$ term is identical across every class's discriminant function and exactly cancels when comparing any two classes — only the linear-in-$x$ terms ($x^T\Sigma^{-1}\mu_k$) and constants remain, giving a linear boundary.
+
+19. **How does LDA used as a dimensionality-reduction technique differ from PCA, and what's the maximum number of components each can produce?**
+    Answer: PCA is unsupervised — it finds directions that maximize total variance in the data, completely ignoring class labels, and can produce up to $\min(n,d)$ components. LDA (Fisher's LDA) is supervised — it uses class labels to find directions maximizing the ratio of between-class scatter to within-class scatter ($w^TS_Bw / w^TS_Ww$), explicitly optimizing for class separability rather than raw variance. Because the between-class scatter matrix $S_B$ has rank at most $K-1$ for $K$ classes, LDA can produce at most $K-1$ meaningful discriminant directions, regardless of $d$ — e.g., a 3-class problem can be losslessly (for separability purposes) projected to at most 2 dimensions.
+
+20. **When would you prefer QDA over LDA, and what's the main risk of doing so?**
+    Answer: Prefer QDA when you have good reason to believe classes genuinely have different covariance structures (e.g., one class is tightly clustered, another is diffusely spread) and you have enough data per class to estimate each full covariance matrix reliably. The main risk is that QDA has far more parameters ($K$ separate $d\times d$ covariance matrices vs. LDA's single shared one) — with limited data per class or high dimensionality, these covariance estimates become noisy/unstable, and QDA's added flexibility turns into overfitting (high variance) rather than a genuine accuracy gain; in that regime LDA's shared-covariance assumption acts as a regularizer.
+
+21. **Compare One-vs-Rest and One-vs-One for multiclass SVM, and explain why sklearn's `SVC` defaults to OvO while `LinearSVC` defaults to OvR.**
+    Answer: OvR trains $K$ binary classifiers on the full (relabeled) dataset each; OvO trains $\binom{K}{2}$ classifiers, each on only the two relevant classes' data. For kernel SVM specifically, each pairwise problem in OvO tends to be simpler/more cleanly separable than a "one class vs. all others combined" problem, and each classifier trains on a smaller subset — since kernel SVM training scales roughly $O(n^2)$-$O(n^3)$, many small pairwise problems can actually be cheaper and more accurate than $K$ large one-vs-rest problems, which is why `SVC` defaults to OvO. `LinearSVC` uses a different, much more scalable linear solver where OvR's $O(K)$ classifiers trained on the full data is already cheap, so there's less incentive to pay OvO's $O(K^2)$ classifier-count cost.
+
+22. **Scenario: you're building a 50-class product-categorization classifier using kernel SVM as the base model, and training time is becoming a bottleneck. How would multiclass strategy choice affect this, and what would you try?**
+    Answer: With $K=50$, OvO requires $\binom{50}{2}=1225$ pairwise classifiers — even though each is cheap individually (small, balanced sub-datasets), the sheer count can dominate wall-clock time, especially with per-classifier overhead. OvR requires only 50 classifiers but each trains on the full (highly imbalanced, 1-vs-49) dataset, which is slower per classifier for kernel SVM. Practical fixes: switch to a linear SVM (`LinearSVC`, OvR by default, scales far better with $n$) if the classes are roughly linearly separable in the given feature space, use a native multiclass model instead (softmax logistic regression, gradient boosting) to avoid the decomposition overhead entirely, or use kernel approximations (Nystroem/random Fourier features) to make a linear solver approximate an RBF kernel at much lower cost.
+
+23. **A colleague argues Naive Bayes and LDA are "basically the same idea." What's actually shared between them, and what's the key structural difference?**
+    Answer: Both are generative classifiers — they model $P(x\mid y)$ and apply Bayes' rule to get $P(y\mid x)$, rather than modeling $P(y\mid x)$ directly (unlike logistic regression). The key structural difference is the independence/covariance assumption: Naive Bayes assumes each feature is conditionally independent given the class (effectively a diagonal covariance with no cross-feature terms, and any per-feature distribution — Gaussian, multinomial, Bernoulli), while LDA assumes a full multivariate Gaussian per class with a *shared* (but not diagonal) covariance matrix across classes, explicitly modeling feature correlations. Gaussian Naive Bayes is, in fact, a restricted special case of LDA/QDA where the shared or class-specific covariance matrix is forced to be diagonal.
 
 ---
 
@@ -746,6 +905,82 @@ preds = ocsvm.fit_predict(X_scaled)
 | One-Class SVM | Normal data occupies a compact region separable via kernel | Moderate (kernel methods scale poorly with n) | Yes (via RBF kernel) | Sensitive to `nu`/`gamma`, slower on large n |
 | Autoencoder | Normal data has learnable, compressible structure that anomalies violate | Excellent (deep learning scales), especially for structured/image/sequence data | Yes (arbitrary non-linear via NN) | Needs enough data and compute to train well; overkill for simple tabular anomaly detection |
 
+### Association Rule Mining (Apriori, FP-Growth)
+
+A different flavor of unsupervised learning: instead of finding clusters or reducing dimensions, association rule mining finds **co-occurrence patterns** in transactional/basket data (classic example: "customers who buy bread and butter also buy milk").
+
+**Key metrics** for a rule $X \Rightarrow Y$ (itemset $X$ implies itemset $Y$):
+
+| Metric | Formula | Meaning |
+|---|---|---|
+| Support | $P(X \cup Y) = \frac{\text{count}(X \cup Y)}{N}$ | How frequently the itemset appears at all — filters out rare, statistically unreliable combinations |
+| Confidence | $P(Y\mid X) = \frac{\text{support}(X\cup Y)}{\text{support}(X)}$ | Of the transactions containing $X$, what fraction also contain $Y$ — the rule's "accuracy" |
+| Lift | $\frac{P(Y\mid X)}{P(Y)} = \frac{\text{confidence}(X\Rightarrow Y)}{\text{support}(Y)}$ | How much more likely $Y$ is given $X$, versus $Y$'s baseline rate. Lift $>1$ means positive association; lift $=1$ means $X$ and $Y$ are independent (confidence alone can be misleadingly high just because $Y$ is common) |
+
+**Apriori algorithm.** Exploits the *Apriori property* (downward closure): if an itemset is frequent (support ≥ min_support), all of its subsets must also be frequent — equivalently, if any subset is infrequent, the superset cannot be frequent. This lets the algorithm prune the search space level-by-level:
+1. Find all frequent 1-itemsets (support ≥ threshold).
+2. Generate candidate 2-itemsets only from frequent 1-itemsets, keep the frequent ones.
+3. Repeat for $k=3,4,\ldots$, generating candidate $k$-itemsets only from frequent $(k-1)$-itemsets, until no frequent itemsets remain.
+4. From the final frequent itemsets, generate rules and filter by minimum confidence/lift.
+
+```python
+from mlxtend.frequent_patterns import apriori, association_rules
+
+frequent_itemsets = apriori(basket_df, min_support=0.01, use_colnames=True)
+rules = association_rules(frequent_itemsets, metric="lift", min_threshold=1.2)
+rules.sort_values("lift", ascending=False).head()
+```
+
+**FP-Growth.** Apriori's repeated full-database scans per level are expensive at scale. FP-Growth instead compresses the database into a prefix tree (FP-tree) built from just two passes, then mines frequent itemsets by recursively traversing conditional sub-trees — no explicit candidate generation step, generally much faster than Apriori on large/dense datasets while finding identical results.
+
+- **When to use:** market-basket analysis, recommendation ("frequently bought together"), cross-sell strategy, web clickstream sequencing, even non-retail uses like finding co-occurring symptoms in medical records or co-occurring genes.
+- **Pitfalls:** combinatorial explosion of candidate itemsets with low min_support on high-cardinality item catalogs (mitigate by raising the support threshold or using FP-Growth); high confidence does **not** imply causation or even real correlation — always check lift; rare-but-high-value items (e.g., expensive products bought infrequently) get filtered out by a naive support threshold, requiring tricks like multiple minimum supports.
+
+### Semi-Supervised Learning: Self-Training & Label Propagation
+
+**Motivation.** Fully supervised learning needs labels for every training point; fully unsupervised learning uses none. In practice, labels are often expensive/slow to obtain (medical annotations, manual review) while unlabeled data is abundant — **semi-supervised learning** sits between the two, using a small labeled set plus a much larger unlabeled set to train a better model than the labeled set alone would allow.
+
+**Core assumptions that make this work at all** (without at least one of these holding, unlabeled data provides no information about $y$):
+- **Smoothness assumption:** points close together in feature space likely share the same label.
+- **Cluster assumption:** points in the same cluster/high-density region likely share the same label; decision boundaries should lie in low-density regions.
+- **Manifold assumption:** high-dimensional data actually lies on a lower-dimensional manifold, and labels vary smoothly along that manifold.
+
+**Self-training (pseudo-labeling).**
+1. Train a base classifier on the small labeled set.
+2. Predict on the unlabeled set; take the predictions the model is most **confident** about (above some probability threshold) and add them to the training set as if they were true labels ("pseudo-labels").
+3. Retrain on labeled + pseudo-labeled data; repeat, progressively expanding the labeled set.
+
+```python
+from sklearn.semi_supervised import SelfTrainingClassifier
+from sklearn.svm import SVC
+
+base = SVC(probability=True, kernel="rbf")
+self_train = SelfTrainingClassifier(base, threshold=0.75)
+self_train.fit(X_combined, y_combined)  # y_combined uses -1 for unlabeled points
+```
+
+**Pitfall — confirmation bias / error amplification.** If the base classifier is systematically wrong on some subregion of feature space (not just randomly noisy), self-training confidently mislabels that region and then *reinforces its own mistake* by retraining on those wrong pseudo-labels — errors compound over iterations rather than average out. Mitigations: conservative confidence thresholds, capping how many pseudo-labels are added per round, and monitoring validation accuracy (on a held-out truly-labeled set) each iteration to catch drift early.
+
+**Label Propagation / Label Spreading (graph-based).** Build a similarity graph over *all* points (labeled and unlabeled), typically with edge weights from an RBF kernel on feature distance, then iteratively propagate label information along graph edges — nearby points converge toward the same label distribution. Label Propagation clamps labeled points' labels permanently; Label Spreading (a regularized variant) allows labeled points' labels to be slightly adjusted too, making it more robust to noisy labels.
+
+```python
+from sklearn.semi_supervised import LabelSpreading
+ls = LabelSpreading(kernel="rbf", gamma=20, alpha=0.2)
+ls.fit(X_combined, y_combined)   # -1 for unlabeled
+```
+
+**Comparison:**
+
+| | Self-Training | Label Propagation/Spreading | Fully-supervised baseline |
+|---|---|---|---|
+| Mechanism | Iteratively retrain on high-confidence pseudo-labels | Propagate labels through a similarity graph | Train only on labeled points |
+| Assumption relied on | Base classifier's confidence is trustworthy | Smoothness/cluster/manifold assumption on the graph | None beyond usual i.i.d. |
+| Works with any base classifier? | Yes (wraps any classifier with `predict_proba`) | No — specific graph-based algorithm | N/A |
+| Main failure mode | Confirmation bias compounding errors | Poor graph construction (wrong `gamma`/kernel) merges or fragments manifold structure | Simply has less data to learn from |
+| Scales to large unlabeled sets? | Yes (bounded by base classifier's cost) | Poor — graph construction/propagation is $O(n^2)$ or worse | N/A |
+
+**When it matters in interviews.** A common follow-up: "you have 500 labeled examples and 50,000 unlabeled ones — what do you do before reaching for deep learning/active learning?" Self-training or label propagation are the classical-ML answers; contrast with **active learning** (query a human to label the *most informative* unlabeled points, rather than trusting the model's own pseudo-labels) as a complementary strategy when a labeling budget exists.
+
 ### Interview Questions
 
 1. **Derive/explain the K-means objective function and describe why Lloyd's algorithm is guaranteed to converge but only to a local optimum.**
@@ -792,6 +1027,27 @@ preds = ocsvm.fit_predict(X_scaled)
 
 15. **What is the fundamental difference between how K-means and GMM assign points to clusters, and when does that difference matter practically?**
     Answer: K-means performs **hard** assignment — each point belongs to exactly one cluster (its nearest centroid), with no notion of confidence/uncertainty. GMM performs **soft** assignment — each point gets a probability distribution over all clusters (responsibilities), reflecting genuine ambiguity for points near cluster boundaries. This matters practically when: points genuinely straddle multiple segments (e.g., a customer who behaves like two personas) and you want to represent that ambiguity rather than force a single label; you need calibrated cluster-membership probabilities for downstream decision-making; or cluster shapes are elliptical/correlated rather than spherical, where GMM's full covariance can represent this while K-means cannot.
+
+16. **Explain support, confidence, and lift, and why confidence alone can be misleading.**
+    Answer: Support = frequency of the itemset in the whole dataset; confidence $P(Y\mid X)$ = accuracy of the rule given $X$ occurred; lift = confidence divided by $Y$'s baseline support. Confidence can be high purely because $Y$ is a very common item overall (e.g., "bread") regardless of $X$ — the rule "buy anything ⇒ buy bread" would have high confidence but lift ≈ 1, meaning $X$ tells you nothing extra about $Y$. Lift is what actually confirms a meaningful association rather than just $Y$'s popularity.
+
+17. **Why does Apriori scan the database multiple times and how does the Apriori (downward-closure) property reduce that cost?**
+    Answer: Naively, checking every possible itemset for frequency requires evaluating $2^{|items|}-1$ subsets — intractable for real catalogs. The downward-closure property guarantees that a $k$-itemset can only be frequent if all of its $(k-1)$-subsets are frequent, so Apriori only needs to generate candidate $k$-itemsets from *already-confirmed-frequent* $(k-1)$-itemsets, pruning the vast majority of the search space level by level, at the cost of one database scan per level to count candidate support.
+
+18. **When would you choose FP-Growth over Apriori, and why does it avoid Apriori's main bottleneck?**
+    Answer: FP-Growth is preferred on large or dense transactional datasets (many items, long transactions) where Apriori's repeated full-database scans and massive candidate-itemset generation become the bottleneck. FP-Growth builds a compressed FP-tree in two passes and mines frequent itemsets by recursing on conditional trees — no explicit candidate generation step at all — so it scales much better while provably returning the identical set of frequent itemsets as Apriori.
+
+19. **What core assumption must hold for semi-supervised learning to actually benefit from unlabeled data, and why doesn't unlabeled data help without it?**
+    Answer: At least one of the smoothness, cluster, or manifold assumptions must hold — i.e., the unlabeled points' positions in feature space must carry real information correlated with the label (nearby points share labels, labels vary smoothly along a low-dimensional structure, or decision boundaries lie in low-density regions). If labels were essentially independent of feature-space position/geometry (assumption violated), then knowing where unlabeled points sit tells you nothing about what their labels would be, so adding them to training can't sharpen the decision boundary — it can only add noise or, worse, actively mislead a self-training loop into confidently wrong pseudo-labels.
+
+20. **Explain the confirmation bias risk in self-training and how you'd detect it in practice.**
+    Answer: If the base classifier is systematically (not just randomly) wrong on some region of feature space — e.g., underrepresented subgroup, a feature interaction it can't capture — self-training will pseudo-label that region confidently but incorrectly, then retrain on those wrong labels, which reinforces the same mistake and can even amplify it over iterations, since the model has no independent signal to correct itself. Detect it by holding out a small truly-labeled validation set (never pseudo-labeled) and tracking validation accuracy across self-training rounds — a self-training run that's overfitting to its own mistakes will show validation performance plateauing or *degrading* even as training-set/pseudo-label agreement looks great.
+
+21. **Compare Label Propagation and self-training on the same task: 1,000 labeled and 20,000 unlabeled points, feature space with well-separated manifold structure. Which would you try first and why?**
+    Answer: Label Propagation/Spreading is a strong first choice here specifically because the scenario states well-separated manifold structure — the graph-based method directly exploits the manifold/smoothness assumption by propagating labels along the similarity graph, and with clearly separated structure the graph edges will correctly reflect true class boundaries, giving clean propagation with low risk of merging unrelated regions. Self-training is a reasonable fallback but is more sensitive to the base classifier's own biases (confirmation bias) and doesn't explicitly leverage the geometric/manifold structure the way a graph-based method does. In practice, both are cheap enough to try and validate against a held-out labeled subset before committing.
+
+22. **How does self-training relate to (and differ from) active learning as a strategy for making the most of a limited labeling budget?**
+    Answer: Both address the same underlying scarcity — limited labels, abundant unlabeled data — but from opposite directions. Self-training trusts the model's *own* most-confident predictions and adds them as pseudo-labels without any human involvement, expanding the training set for free but risking compounding the model's existing blind spots. Active learning instead identifies the unlabeled points the model is *most uncertain* about (or otherwise most informative, e.g., via query-by-committee or expected model change) and routes exactly those to a human annotator, spending a labeling budget where it will improve the model the most, rather than reinforcing what the model already "knows." They're often combined: self-train confidently on easy/confident points while active-learning the hard/ambiguous ones.
 
 ---
 
@@ -1060,3 +1316,45 @@ PartialDependenceDisplay.from_estimator(model, X_train, features=["feature_x"], 
 
 38. **Q: What is the "no free lunch" implication for choosing between these algorithms?**
     A: No single algorithm dominates across all datasets/tasks — the right choice depends on data size, dimensionality, noise, interpretability needs, and computational constraints, which is why understanding the trade-offs of each method (covered throughout this document) matters more than memorizing a "best" algorithm.
+
+39. **Q: What's the practical difference between MAE and Huber loss when your data has outliers?**
+    A: MAE is robust but has a constant-magnitude gradient everywhere, which can cause optimization to oscillate near the minimum; Huber is quadratic (smooth gradient) near zero and linear (bounded, outlier-robust) beyond a threshold $\delta$, giving smoother convergence while still capping outlier influence.
+
+40. **Q: What does minimizing quantile loss at $\tau=0.5$ reduce to?**
+    A: MAE — it recovers the conditional median.
+
+41. **Q: In association rule mining, what does "lift = 1" tell you?**
+    A: $X$ and $Y$ are statistically independent — buying $X$ tells you nothing about the likelihood of buying $Y$, even if the rule's confidence looks high just because $Y$ is popular overall.
+
+42. **Q: Why does Apriori need to scan the database once per itemset-size level?**
+    A: Because it generates and counts the support of all candidate $k$-itemsets (built only from confirmed frequent $(k-1)$-itemsets) in that pass before moving to level $k+1$ — support counts must come from the actual transaction data, not be inferred.
+
+43. **Q: One-sentence reason to prefer FP-Growth over Apriori at scale?**
+    A: FP-Growth mines frequent itemsets from a compressed FP-tree with no explicit candidate generation, avoiding Apriori's expensive repeated full-database scans.
+
+44. **Q: For model evaluation, cross-validation strategy, dimensionality reduction, imbalanced-data handling, feature encoding, and hyperparameter search — which file covers these in depth?**
+    A: [06_Feature_Engineering_and_Model_Evaluation.md](06_Feature_Engineering_and_Model_Evaluation.md) — this ML Fundamentals file focuses on the algorithms themselves (how each model works, trains, and its assumptions); metrics, validation strategy, PCA/t-SNE/UMAP, SMOTE/class-weighting, encoding, and Grid/Random/Bayesian hyperparameter search live in the dedicated Feature Engineering & Model Evaluation syllabus to avoid duplicating that content across files.
+
+45. **Q: What does the perceptron update rule do, in one sentence?**
+    A: It only adjusts weights when a training point is misclassified, nudging the decision boundary in the direction that would have classified that point correctly.
+
+46. **Q: Why did the perceptron's inability to solve XOR matter historically?**
+    A: XOR isn't linearly separable, so a single perceptron provably cannot learn it — this limitation (highlighted by Minsky & Papert) contributed to reduced interest in neural network research until multi-layer perceptrons with backpropagation showed stacked non-linear layers could solve it.
+
+47. **Q: LDA vs QDA — which has more parameters and why?**
+    A: QDA, because it estimates a separate full covariance matrix per class instead of one shared covariance matrix across all classes, at the cost of needing more data to estimate reliably.
+
+48. **Q: Is "LDA" for classification the same algorithm as "LDA" in topic modeling?**
+    A: No — Linear Discriminant Analysis (supervised classifier/dimensionality reduction, assumes Gaussian class-conditional densities) and Latent Dirichlet Allocation (unsupervised generative topic model over documents/words) are unrelated algorithms that happen to share an acronym.
+
+49. **Q: One-vs-One requires how many classifiers for K classes?**
+    A: $\binom{K}{2} = K(K-1)/2$ — one per pair of classes.
+
+50. **Q: Name three classifiers that handle multiclass natively without needing OvR/OvO decomposition.**
+    A: Decision trees (and tree ensembles), Naive Bayes, and KNN — all generalize directly to any number of classes via their core mechanism (impurity criteria, argmax posterior, majority vote).
+
+51. **Q: What's the main risk of self-training / pseudo-labeling?**
+    A: Confirmation bias — the model can confidently mislabel unlabeled points it's systematically wrong about, then reinforce that same mistake by retraining on its own incorrect pseudo-labels.
+
+52. **Q: What's the difference between self-training and active learning in one sentence?**
+    A: Self-training trusts the model's own most-confident predictions as free labels; active learning sends the model's *least*-confident (most informative) points to a human for real labels.
