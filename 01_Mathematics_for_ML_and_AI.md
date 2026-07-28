@@ -12,16 +12,21 @@ Every model you will ever train, deploy, or debug is a mathematical object weari
    - [Eigenvalues, Eigenvectors, Eigendecomposition, Diagonalization](#eigenvalues-eigenvectors-eigendecomposition-diagonalization)
    - [Singular Value Decomposition (SVD) and PCA](#singular-value-decomposition-svd-and-pca)
    - [Positive Definite / Semi-Definite Matrices, Quadratic Forms](#positive-definite--semi-definite-matrices-quadratic-forms)
+   - [Condition Number and Numerical Stability of Linear Systems](#condition-number-and-numerical-stability-of-linear-systems)
+   - [Cholesky, LU, and QR Decompositions](#cholesky-lu-and-qr-decompositions)
    - [Matrix Calculus Basics (Gradients of Vector/Matrix Expressions)](#matrix-calculus-basics-gradients-of-vectormatrix-expressions)
    - [Interview Questions — Linear Algebra](#interview-questions--linear-algebra)
 2. [Calculus and Optimization](#calculus-and-optimization)
    - [Derivatives, Partial Derivatives, Gradients, Directional Derivatives](#derivatives-partial-derivatives-gradients-directional-derivatives)
    - [Chain Rule and Backpropagation](#chain-rule-and-backpropagation)
+   - [Gradient Checking (Finite-Difference Verification)](#gradient-checking-finite-difference-verification)
    - [Jacobians and Hessians, Second-Order Optimization](#jacobians-and-hessians-second-order-optimization)
+   - [Quasi-Newton Methods: BFGS and L-BFGS](#quasi-newton-methods-bfgs-and-l-bfgs)
    - [Taylor Series Approximation](#taylor-series-approximation)
    - [Convexity: Convex Functions, Convex Sets, Global vs Local Minima](#convexity-convex-functions-convex-sets-global-vs-local-minima)
    - [Gradient Descent Variants](#gradient-descent-variants)
    - [Learning Rate Schedules, Warmup, Convergence Criteria](#learning-rate-schedules-warmup-convergence-criteria)
+   - [Numerical Stability: Log-Sum-Exp and Overflow-Safe Softmax](#numerical-stability-log-sum-exp-and-overflow-safe-softmax)
    - [Constrained Optimization: Lagrange Multipliers, KKT Conditions](#constrained-optimization-lagrange-multipliers-kkt-conditions)
    - [Interview Questions — Calculus and Optimization](#interview-questions--calculus-and-optimization)
 3. [Information Theory](#information-theory)
@@ -237,6 +242,59 @@ A = [[1, 2], [2, 1]]  →  eigenvalues: 3, -1  →  indefinite
 - PSD ≠ PD: a PSD matrix can be singular (zero eigenvalue) and hence non-invertible — ridge regression's $\lambda I$ term is added specifically to convert a PSD-but-singular $X^TX$ into a strictly PD (and invertible) matrix.
 - Testing PD-ness by checking $A_{ii}>0$ for diagonal entries alone is insufficient — need the full eigenvalue or principal-minor test.
 - The quadratic form definition requires $A$ effectively symmetric; for asymmetric $A$, only the symmetric part $\frac{1}{2}(A+A^T)$ contributes to $\mathbf{x}^TA\mathbf{x}$.
+
+### Condition Number and Numerical Stability of Linear Systems
+
+**Definition.** The condition number of $A$ measures how much relative error in the input of a linear system can be amplified in the output. Formally $\kappa(A) = \|A\|\cdot\|A^{-1}\|$ for any chosen matrix norm; using the spectral (induced $L_2$) norm, this reduces to
+```
+κ(A) = σ_max / σ_min
+```
+the ratio of $A$'s largest to smallest singular value. For symmetric positive definite $A$ (e.g., a Hessian or covariance matrix), singular values equal eigenvalues, so $\kappa(A)=\lambda_{max}/\lambda_{min}$. An orthogonal matrix has $\kappa=1$ (perfectly conditioned — it doesn't distort lengths at all); $\kappa\to\infty$ as $A$ approaches singularity.
+
+**Why it matters — error amplification.** For $A\mathbf{x}=\mathbf{b}$, a small relative perturbation in $\mathbf{b}$ (e.g., floating-point rounding, sensor noise) propagates into the solution bounded by
+```
+‖δx‖/‖x‖ ≤ κ(A) · ‖δb‖/‖b‖
+```
+A large $\kappa(A)$ means tiny input noise can produce a hugely different solution — the system is **ill-conditioned**, and no algorithm (however numerically careful) can fully undo this; it's a property of the *problem*, not the solver.
+
+**Worked example.** $A=\text{diag}(1000, 1)$: $\kappa(A)=1000/1=1000$. Geometrically, $A$'s unit-circle image is an extremely elongated ellipse — exactly the "narrow valley" picture from the Hessian/gradient-descent discussion above (recall the $H=\text{diag}(2,6)$ example, $\kappa=3$, that already zig-zagged). At $\kappa=1000$, gradient descent on the corresponding quadratic needs a step size small enough to avoid diverging along the stiff ($\lambda_{max}$) direction, so it crawls extremely slowly along the flat ($\lambda_{min}$) direction — roughly $O(\kappa)$ iterations to converge to fixed accuracy, vs. $O(\sqrt\kappa)$ for momentum/Nesterov, vs. condition-number-independent for exact Newton.
+
+**Why it matters in ML.** Feature scaling/standardization directly improves the conditioning of $X^TX$ (and hence the loss Hessian for linear/logistic regression), which is a large part of *why* "always standardize your features" is such robust default advice — it's not just about comparable units, it's about optimization speed. Forming $X^TX$ explicitly **squares** the condition number ($\kappa(X^TX)=\kappa(X)^2$), which is why numerically-aware solvers use QR or SVD directly on $X$ (see below) rather than the normal equations when $X$ is even moderately ill-conditioned. Libraries like `numpy.linalg.cond` let you check conditioning before trusting a solved system.
+
+**Pitfalls.**
+- Condition number is norm-dependent; interviewers almost always mean the spectral/2-norm version ($\sigma_{max}/\sigma_{min}$) unless stated otherwise.
+- A low condition number does *not* by itself guarantee fast convergence for non-convex or non-quadratic objectives — the clean $O(\kappa)$/$O(\sqrt\kappa)$ iteration bounds are proven for convex quadratics; they're only a useful local intuition elsewhere.
+- Confusing "ill-conditioned" (a numerical/optimization property, fixable by rescaling/regularizing) with "rank-deficient" (a structural property — $\kappa=\infty$ exactly, not just large) — ridge's $\lambda I$ fixes both simultaneously but they're conceptually distinct failure modes.
+
+### Cholesky, LU, and QR Decompositions
+
+**Why decompositions instead of explicit inverses.** As noted above, computing $A^{-1}$ explicitly is $O(n^3)$ and numerically fragile. In practice, solving $A\mathbf{x}=\mathbf{b}$ or evaluating quantities that "look like" they need an inverse is done via a matrix **factorization** chosen to match $A$'s structure, then cheap forward/back-substitution.
+
+**LU decomposition** (general square $A$): $A=LU$ ($L$ unit lower-triangular, $U$ upper-triangular), computed via Gaussian elimination. For numerical stability with a general (non-symmetric) matrix, **partial pivoting** is required: $PA=LU$ for some row-permutation matrix $P$ — without pivoting, a small pivot element can cause catastrophic error amplification during elimination.
+
+**Cholesky decomposition** (symmetric positive definite $A$ only): a unique factorization $A=LL^T$ with $L$ lower-triangular and positive diagonal entries, computed via
+```
+L_jj = sqrt( A_jj - Σ_{k<j} L_jk² )
+L_ij = ( A_ij - Σ_{k<j} L_ik L_jk ) / L_jj      for i > j
+```
+Costs about $n^3/3$ flops — roughly half of general LU — and needs **no pivoting**, because positive-definiteness itself guarantees numerical stability of the elimination. If, while computing it, some $A_{jj}-\sum L_{jk}^2$ comes out negative (square root of a negative number), that's a fast, standard numerical *test* that $A$ is not actually PD.
+
+**Worked example.** $A=\begin{bmatrix}4&2\\2&5\end{bmatrix}$ (check PD: leading minors $4>0$ and $\det=20-4=16>0$). $L_{11}=\sqrt4=2$; $L_{21}=2/2=1$; $L_{22}=\sqrt{5-1^2}=2$. So $L=\begin{bmatrix}2&0\\1&2\end{bmatrix}$, and indeed $LL^T=\begin{bmatrix}4&2\\2&5\end{bmatrix}=A$. To solve $A\mathbf{x}=\mathbf{b}$: forward-substitute $L\mathbf{y}=\mathbf{b}$, then back-substitute $L^T\mathbf{x}=\mathbf{y}$ — never forming $A^{-1}$.
+
+**QR decomposition** (any $A$, including rectangular): $A=QR$ ($Q$ orthogonal/orthonormal columns, $R$ upper-triangular), computed via Gram-Schmidt or (more stably) Householder reflections. Used to solve least-squares $\min_w\|Xw-y\|_2^2$ *directly on $X$* — since $Q^TQ=I$, the normal equations $X^TXw=X^Ty$ reduce to the triangular system $Rw=Q^Ty$, avoiding ever forming $X^TX$ and therefore avoiding the condition-number-squaring problem described above.
+
+| Decomposition | Requires | Cost | Typical use |
+|---|---|---|---|
+| LU (+ pivoting) | square, invertible | $O(n^3)$ | general linear solve (`np.linalg.solve`) |
+| Cholesky | symmetric PD | $\sim n^3/3$ | covariance/kernel/Hessian solves, Gaussian sampling, GP regression |
+| QR | any shape | $O(mn^2)$ for $m\times n$ | least squares, orthogonalization, numerically stable regression |
+
+**Why it matters in ML.** Gaussian Process regression solves and evaluates marginal likelihood via Cholesky of the kernel matrix (log-determinant falls out as $2\sum_i \log L_{ii}$, itself numerically far safer than computing $\det$ directly); sampling a multivariate Gaussian (Q11 above) needs exactly this $L$; natural-gradient and second-order optimizers that need $H^{-1}\mathbf{v}$ solve a linear system via Cholesky/CG rather than inverting $H$; `scikit-learn`'s and `statsmodels`' linear regression solvers default to QR/SVD-based least squares specifically to sidestep normal-equation ill-conditioning.
+
+**Pitfalls.**
+- Attempting Cholesky on a matrix that *should* be PD but isn't quite (due to floating-point error, e.g., a sample covariance matrix with $n<d$) throws a decomposition error — the standard fix is adding a small "jitter" $\epsilon I$ before decomposing, mirroring ridge regularization's role in inversion.
+- LU *without* pivoting can be numerically unstable or fail outright even for a perfectly invertible matrix, if elimination happens to divide by a very small pivot.
+- Solving via normal equations + Cholesky is faster than QR when it's numerically safe to do so (well-conditioned $X$), but QR (or SVD) is the safer default when $X$'s conditioning is unknown or suspect.
 
 ### Matrix Calculus Basics (Gradients of Vector/Matrix Expressions)
 
